@@ -1,0 +1,7 @@
+.git
+.env
+.env.*
+config.json
+data
+private
+__pycache__

@@ -1,0 +1,18 @@
+services:
+  memberships:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:4248:4248"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - memberships-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  memberships-data:
