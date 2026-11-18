@@ -2,7 +2,7 @@ import base64,datetime as dt,hashlib,hmac,json,os,tempfile,unittest
 from memberships import Config,State,Reconciler,timestamp
 SECRET='test-only-not-a-production-secret'
 CLOCK=timestamp('2026-11-16T12:00:00Z')
-def configuration(live=False):return Config({'store':'example','live':live,'plans':{'monthly':{'product_id':1,'period':30,'category_id':10,'promotion_id':20,'category_name':'Membership App / Monthly'}}})
+def configuration(live=False):return Config({'store':'example','grace_days':0,'live':live,'plans':{'monthly':{'product_id':1,'period':30,'category_id':10,'promotion_id':20,'category_name':'Membership App / Monthly'}}})
 def event(**overrides):
     d={'id':1001,'customer':{'id':42},'product':{'id':1,'variant_id':None},'status':'active','recurring_period':30,'updated_at':'2026-11-16T11:00:00Z','next_order_date':'2026-12-16T00:00:00Z'};d.update(overrides);return d
 class Events(unittest.TestCase):
@@ -101,3 +101,27 @@ class AdditionalDelivery(unittest.TestCase):
         headers=self.headers();headers['Jumpseller-Hmac-Sha256-V2']=headers.pop('Jumpseller-Signature');self.assertEqual('accepted',self.s.signed_delivery(self.raw,headers,SECRET,CLOCK))
     def test_retry_new_delivery_same_body(self):
         self.s.signed_delivery(self.raw,self.headers(),SECRET,CLOCK);self.assertEqual('duplicate',self.s.signed_delivery(self.raw,self.headers(delivery='retry'),SECRET,CLOCK))
+
+class TimestampFormats(unittest.TestCase):
+    def test_rails_utc(self):self.assertEqual(timestamp('2026-11-16T12:00:00Z'),timestamp('2026-11-16 12:00:00 UTC'))
+    def test_naive_rejected(self):
+        with self.assertRaises(ValueError):timestamp('2026-11-16 12:00:00')
+
+class DeletedCustomer(unittest.TestCase):
+    setUp=Events.setUp
+    receive=Events.receive
+    def test_deleted_customer_cancel_revokes(self):
+        self.receive();self.receive(event(customer=None,status='canceled',next_order_date=None,updated_at='2026-11-16T11:30:00Z'));self.assertFalse(self.s.active(CLOCK))
+    def test_unknown_deleted_customer_ignored(self):self.assertEqual('ignored_deleted_customer',self.receive(event(customer=None,status='canceled',next_order_date=None)))
+
+class RenewalLease(unittest.TestCase):
+    setUp=Events.setUp
+    receive=Events.receive
+    def test_paid_renewal_replaces_expiration(self):
+        self.receive(event(next_order_date='2026-11-16T13:00:00Z'))
+        self.receive(event(updated_at='2026-11-16T11:30:00Z',next_order_date='2026-12-16T03:00:00Z'))
+        self.assertEqual({(42,'monthly')},self.s.active(timestamp('2026-11-17T00:00:00Z')))
+        self.assertEqual('2026-12-16T03:00:00+00:00',self.s.rows()[0]['valid_until'])
+    def test_old_paid_event_cannot_extend_after_pending(self):
+        self.receive();self.receive(event(status='pending',updated_at='2026-11-16T11:30:00Z',next_order_date=None))
+        self.assertEqual('stale',self.receive());self.assertTrue(self.s.active(CLOCK));self.assertFalse(self.s.active(timestamp('2026-12-16T00:00:00Z')))

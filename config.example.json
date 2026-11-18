@@ -1,6 +1,8 @@
 {
   "store": "your-store-code",
   "live": false,
+  "allow_local_readonly": false,
+  "grace_days": 5,
   "plans": {
     "monthly": {"product_id": 1, "variant_id": null, "period": 30, "category_id": 10, "category_name": "Membership App / Monthly", "promotion_id": 20},
     "annual": {"product_id": 1, "variant_id": null, "period": 365, "category_id": 11, "category_name": "Membership App / Annual", "promotion_id": 21}
