@@ -27,6 +27,8 @@ class RenewalAuditor:
                 # The server route is customer-scoped, but reject inconsistent identities.
                 if order.get('customer', {}).get('id') != customer:
                     raise ValueError('Order customer mismatch')
+                if oid in orders:
+                    raise ValueError('Overlapping or inconsistent order pagination')
                 orders[oid] = order
             if len(batch) < 100:
                 return list(orders.values()), True
@@ -47,13 +49,32 @@ class RenewalAuditor:
                 continue
             status = order.get('status_enum') or str(order.get('status', '')).lower().replace(' ', '_')
             candidates.append({'order_id': order['id'], 'status': status,
-                'recurring_source': order.get('source', {}).get('created_from') == 'product_subscription',
+                'recurring_source': isinstance(order.get('source'),dict) and order['source'].get('created_from') == 'product_subscription',
                 'created_at': order.get('created_at'), 'completed_at': order.get('completed_at')})
+        for c in candidates:
+            c['evidence'] = 'subscription_generated_order' if c['recurring_source'] else 'recurrence_source_unconfirmed'
+            c['paid_recurring_order'] = c['recurring_source'] and c['status']=='paid'
+            c['subscription_match_confirmed'] = False
+        paid_recurring = any(c['paid_recurring_order'] for c in candidates)
         paid = any(c['status'] == 'paid' for c in candidates)
         pending = any(c['status'] == 'pending_payment' for c in candidates)
         status = 'candidates_unverified' if paid else ('waiting_for_paid_order' if pending else 'no_candidate')
+        if paid_recurring:status='paid_recurring_order_requires_review'
+        if not complete:status='incomplete_order_scan'
+        known_matches=[]
+        for known in self.state.rows():
+            known_plan=self.state.config.plans[known['plan']]
+            if known['customer']==row['customer'] and (known_plan['product_id'],known_plan.get('variant_id'))==(plan['product_id'],plan.get('variant_id')):
+                known_matches.append(known['id'])
+        # Our event ledger is not an authoritative inventory: missing webhooks and
+        # other subscriptions are possible, even when this list contains one ID.
+        blockers=['subscription_inventory_not_authoritative','exact_subscription_join_unavailable','paid_period_unavailable']
+        if len(known_matches)>1:blockers.append('multiple_known_subscriptions_for_product')
+        if not complete:blockers.append('incomplete_order_scan')
         return {'subscription_id': row['id'], 'customer_id': row['customer'], 'status': status,
             'correlation': 'exact_join_unavailable', 'complete': complete,
+            'paid_recurring_order_found':paid_recurring, 'known_subscription_ids':sorted(known_matches),
+            'subscription_inventory_complete':False,'auto_renewal_blockers':blockers,
             'candidates': sorted(candidates, key=lambda c: c['order_id']),
             'benefits_changed': False, 'checked_at': clock.isoformat(),
             'phase': ('before' if clock < boundary else 'at_or_after') if boundary else 'unknown',

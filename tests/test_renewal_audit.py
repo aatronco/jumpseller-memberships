@@ -34,7 +34,7 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(before,self.s.rows());self.assertFalse(r['benefits_changed']);self.assertFalse(self.s.active(CLOCK+dt.timedelta(days=10)))
     def test_paid_near_boundary_unverified(self):
         self.s.db.execute('UPDATE subscriptions SET valid_until=?',(CLOCK.isoformat(),));self.s.db.commit()
-        a=RenewalAuditor(self.s,API([[order()]]));r=a.run_due(CLOCK)[0];self.assertEqual('candidates_unverified',r['status']);self.assertEqual('exact_join_unavailable',r['correlation'])
+        a=RenewalAuditor(self.s,API([[order()]]));r=a.run_due(CLOCK)[0];self.assertEqual('paid_recurring_order_requires_review',r['status']);self.assertEqual('exact_join_unavailable',r['correlation'])
     def test_pagination_and_incomplete(self):
         a=RenewalAuditor(self.s,API([[order(i) for i in range(1,101)],[]]));a.run_due(CLOCK);self.assertEqual(3,len(a.api.calls));self.assertTrue(a.results()[0]['complete'])
         b=RenewalAuditor(self.s,API([[order(i) for i in range(1,101)]]),max_pages=1);r=b.run_due(CLOCK+dt.timedelta(days=1))[0];self.assertFalse(r['complete'])
@@ -76,3 +76,42 @@ class BoundaryRefresh(unittest.TestCase):
         self.s.db.execute('UPDATE subscriptions SET valid_until=?',((CLOCK+dt.timedelta(days=40)).isoformat(),));self.s.db.commit()
         result=a.run_due(CLOCK+dt.timedelta(seconds=1))
         self.assertEqual(1,len(result));self.assertEqual((CLOCK+dt.timedelta(days=40)).isoformat(),result[0]['expected_renewal_at'])
+
+class RecurrenceEvidence(unittest.TestCase):
+    setUp=AuditTests.setUp
+    tearDown=AuditTests.tearDown
+    def check(self,o=None):
+        self.s.db.execute('UPDATE subscriptions SET valid_until=?',(CLOCK.isoformat(),));self.s.db.commit()
+        a=RenewalAuditor(self.s,API([[o or order()]]))
+        with self.s.db:self.s.db.execute('DELETE FROM renewal_audits')
+        return a.run_due(CLOCK)[0]
+    def test_paid_recurrence_positive_evidence_not_lease(self):
+        before=self.s.rows()[0]['valid_until'];r=self.check()
+        self.assertTrue(r['paid_recurring_order_found']);self.assertTrue(r['candidates'][0]['paid_recurring_order'])
+        self.assertEqual('subscription_generated_order',r['candidates'][0]['evidence'])
+        self.assertFalse(r['benefits_changed']);self.assertFalse(self.s.active(CLOCK))
+    def test_single_known_subscription_not_proof_of_uniqueness(self):
+        r=self.check();self.assertEqual([1001],r['known_subscription_ids']);self.assertFalse(r['subscription_inventory_complete'])
+        self.assertIn('subscription_inventory_not_authoritative',r['auto_renewal_blockers']);self.assertFalse(r['candidates'][0]['subscription_match_confirmed'])
+    def test_multiple_known_subscriptions_mark_ambiguity(self):
+        self.s.db.execute("INSERT INTO subscriptions SELECT 1002,customer,plan,version,digest,status,valid_until,quarantine FROM subscriptions WHERE id=1001");self.s.db.commit()
+        r=self.check();self.assertEqual([1001,1002],r['known_subscription_ids']);self.assertIn('multiple_known_subscriptions_for_product',r['auto_renewal_blockers'])
+    def test_unpaid_recurrence_is_not_paid(self):
+        r=self.check(order(status='pending_payment'));self.assertTrue(r['candidates'][0]['recurring_source']);self.assertFalse(r['paid_recurring_order_found']);self.assertEqual('waiting_for_paid_order',r['status'])
+    def test_manual_paid_not_recurrence(self):
+        r=self.check(order(source='checkout'));self.assertFalse(r['paid_recurring_order_found']);self.assertEqual('recurrence_source_unconfirmed',r['candidates'][0]['evidence'])
+    def test_missing_source_does_not_confirm_recurrence(self):
+        for source in (None,{},'product_subscription'):
+            o=order();o['order']['source']=source;r=self.check(o);self.assertFalse(r['paid_recurring_order_found'])
+    def test_refunded_recurrence_is_not_paid(self):
+        r=self.check(order(status='refunded'));self.assertFalse(r['paid_recurring_order_found']);self.assertFalse(r['benefits_changed'])
+    def test_partial_pages_do_not_prove_match(self):
+        self.s.db.execute('UPDATE subscriptions SET valid_until=?',(CLOCK.isoformat(),));self.s.db.commit()
+        r=RenewalAuditor(self.s,API([[order(i) for i in range(1,101)]]),max_pages=1).run_due(CLOCK)[0]
+        self.assertEqual('incomplete_order_scan',r['status']);self.assertTrue(r['paid_recurring_order_found']);self.assertFalse(r['complete']);self.assertFalse(r['benefits_changed'])
+    def test_overlapping_pages_fail_closed(self):
+        r=RenewalAuditor(self.s,API([[order(i) for i in range(1,101)],[order(1)]])).run_due(CLOCK)[0]
+        self.assertEqual('audit_failed',r['status']);self.assertFalse(r['complete'])
+    def test_conflicting_same_order_fails_closed(self):
+        r=RenewalAuditor(self.s,API([[order(1),order(1,status='refunded')]])).run_due(CLOCK)[0]
+        self.assertEqual('audit_failed',r['status']);self.assertFalse(r['benefits_changed'])
